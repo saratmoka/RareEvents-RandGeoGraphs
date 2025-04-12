@@ -13,7 +13,7 @@ This repository provides Python code for estimating the rare events corresponds 
 - Jupyter-Notebook (>=7.2.2)
 
 # Dowload Instructions
-Download following files from this repository to a local folder on your computer. Note all the files must in the same folder. 
+Download following files from this repository to a local folder on your computer. Note that all the files must be saved in the same folder. 
 - Rare-Event-Simulation.ipynb
 - ec.py
 - md.py
