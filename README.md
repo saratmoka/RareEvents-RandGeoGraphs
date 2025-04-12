@@ -1,5 +1,5 @@
 # Rare Events in Random Geometric Graphs
-This repository provides Python code for estimating the rare events corresponds to edge count and maximum degree of random geometric graphs on a square window usning the following three methods 
+This repository provides Python code for estimating the rare events correspond to the edge count and maximum degree of random geometric graphs on a square window usning the following three methods 
 
 - Naive Monte Carlo;
 - Conditional Monte Carlo;
