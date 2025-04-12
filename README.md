@@ -17,6 +17,7 @@ Download following files from this repository to a local folder on your computer
 - Rare-Event-Simulation.ipynb
 - ec.py
 - md.py
+- image.png
 
 # Running Instructions
 Open the jupyter notebook *Rare-Event-Simulation.ipynb*. All the instructions on how to estimate the rare-event probabilties associate with are found in the notebook. 
