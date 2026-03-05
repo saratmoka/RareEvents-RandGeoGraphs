@@ -1,6 +1,12 @@
 # Rare Events in Random Geometric Graphs
 
-This repository provides Python code for estimating rare-event probabilities in random geometric graphs (Gilbert graphs) on a square window. Six rare events are covered:
+This repository provides Python code for estimating rare-event probabilities in random geometric graphs (Gilbert graphs) on a square window. The code is also available as the [pyregg](https://pypi.org/project/pyregg/) Python package:
+
+```bash
+pip install pyregg
+```
+
+Six rare events are covered:
 
 | Module | Rare Event |
 |--------|-----------|
