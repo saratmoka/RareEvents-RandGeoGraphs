@@ -1,473 +1,404 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Created on Mon July 3 2023
+Numba-accelerated version of ec.py.
 
-@author: Dr Sarat Moka, The School of Mathematics and Statistics, University of New South Wales.
+naiveMC and conditionalMC are identical to ec.py.
 
-s.moka@unsw.edu.au, https://saratmoka.com
+ISMC replaces the numpy-based inner loop with a @njit-compiled kernel,
+eliminating Python/numpy call overhead for the ~300-element neighbourhood
+updates and enabling native-speed loops throughout.
 
-This code provides Naive MC, Conditional MC, and Importance Sampling MC for estimation 
-the edge count related rare-events in random geometric graphs, also known as Gilbert Graphs. 
-Refer to the paper Moka, Christian, Schimdt, and Kroese (2025) for more details.
+Key changes versus ec.py ISMC:
+  - BinnedPoints stored as a pre-allocated 4-D numpy array (nBins x nBins x
+    max_pts_bin x 2) instead of a list-of-lists, so it can be passed to @njit.
+  - The neighbourhood update loop (OrderMatrix + hist) is a plain Python for-
+    loop inside @njit — compiled to native code, no numpy call overhead.
+  - Squared-distance comparison replaces linalg.norm (avoids sqrt + function
+    call overhead inside the edge-count loop).
+  - Working arrays (OrderMatrix, BinnedPoints, BinCounts, hist, LHR) are pre-
+    allocated once outside the outer loop and reset inside the kernel.
+  - The first call to ISMC triggers JIT compilation (~2–5 s one-time cost,
+    excluded from the reported timing).
 
+Author: Dr Sarat Moka, UNSW Mathematics and Statistics.
 """
-#import sys 
-#import os
-#import datetime
-#import bisect
+
 import time
-#from tqdm import tqdm
-#import matplotlib.pyplot as plt
-#from matplotlib import colors
-#import matplotlib.patches as patches
-#import pandas as pd
 import numpy as np
 from numpy import linalg
 from scipy.stats import poisson
 from IPython.display import clear_output
+from numba import njit
 
-sqrt_2 = np.sqrt(2) ## Compute square root of 2 just once.
+
+# ── Utility ──────────────────────────────────────────────────────────────────
 
 def sci(x, digits=2):
     return f"{x:.{digits}e}".replace("e-0", "e-").replace("e+0", "e+")
 
-'''
-Counts edges between new point and existing points
-'''
-def newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, nBins):
 
+# ── Helpers shared by naiveMC / conditionalMC (identical to ec.py) ───────────
+
+def newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, nBins):
     count = 0
-    bin_x = int(NewPoint[0]/BinEdg)
-    bin_y = int(NewPoint[1]/BinEdg)
-    
-    for i in range(max(0, bin_x-1), min(bin_x+2, nBins)):
-        for j in range(max(0, bin_y-1), min(bin_y+2, nBins)):
+    bin_x = int(NewPoint[0] / BinEdg)
+    bin_y = int(NewPoint[1] / BinEdg)
+    for i in range(max(0, bin_x - 1), min(bin_x + 2, nBins)):
+        for j in range(max(0, bin_y - 1), min(bin_y + 2, nBins)):
             for pt in BinnedPoints[i][j]:
                 if linalg.norm(pt - NewPoint) < IntRange:
                     count += 1
     return count
 
-'''
-Naive MC
-'''
-def naiveMC(WindLen, Kappa, IntRange, Level, MaxIter=10**8, WarmUp = 100000, Tol=0.001):
-    """
-    Implementation of the naive Monte Carlo simulation method for estimating the rare-event 
-    probabilities on the edge count. 
 
-    Parameters
-    ----------
-    WindLen : float
-        Length of each side of the square window (lambda).
-    Kappa : float
-        Intensity of the the Poisson point process.
-    IntRange : float
-        Interation range create edges in the Geometric random graph. 
-    Level : int 
-        Threshold parameter ell in the rare-event definition on edge count.
-    MaxIter : int
-        Maximum number iterations. Algorithm terminates irrespective convergence once 
-        the number of iterations reaches this number. 
-        Default value 10**8
-    WarmUp : int
-        Minimum number of iterations used in the algorithm. Termination conditions are 
-        checked only after these many iterations. 
-        Default value 100000.
-    Tol : float
-        Tolerance used for termination. Algorithm terminates when the relative variance of 
-        the mean estimator Z falls below Tol consecutively over 100 iterations. 
-        Default value 0.001.
-
-    Returns
-    -------
-    result : dictionary
-    
-             result["mean"] : Sample mean estimate
-             result["mse"] : Sample mean square estimate
-             result["time"] : Process time taken by the algorithm
-             result["niter"] : Number of iterations before termination
-
-    """
-
-    ExpPoiCount = Kappa*(WindLen**2) ## Expected number of Poisson points.
-    BinSize = int(WindLen/IntRange)     ## Number of bins. 
-    BinEdg = WindLen/BinSize            ## Side length of each bin.
-    MeanEst = 0.0                          ## Empirical average of the estimator.
-    Time = 0.0
-    
-    Patience = 0
-    l = 0
-    stop = False
-    print("Warming up ...... ")
-    
-    while not stop:
-        tic = time.process_time()
-        l += 1
-        BinnedPoints = [[[] for _ in range(BinSize)] for _ in range(BinSize)]
-        EdgeCount = 0
-        N = np.random.poisson(ExpPoiCount)
-        Y = 1
-        n = 1
-        while Y == 1 and n <= N:
-            NewPoint = WindLen*np.random.random_sample(2)
-            n = n + 1
-            EdgeCount = EdgeCount + newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, BinSize)
-            bin_x = int(NewPoint[0]/BinEdg)
-            bin_y = int(NewPoint[1]/BinEdg)
-            BinnedPoints[bin_x][bin_y].append(NewPoint)
-            if EdgeCount > Level:
-                Y = 0
-                
-        MeanEst = ((l-1)*MeanEst + Y)/l
-        
-        if MeanEst != 0:
-            RV = 1/MeanEst - 1
-        else:
-            RV = np.inf
-
-        toc = time.process_time()
-        Time += toc - tic
-        
-        if l%WarmUp == 0:
-            clear_output(wait=True)
-            print('\n----- Iteration: ', l, '-----')
-            print('\nMean estimate Z (NMC):', sci(MeanEst)) 
-            print('Relative variance of Y (NMC):', sci(RV)) 
-            print('Relative variance of Z (NMC):', sci(RV/l)) 
-                
-        if l >= WarmUp:
-            if RV/l < Tol:
-                Patience += 1
-            else:
-                Patience = 0 
-        # else:
-        #     num_dots = int(l // (WarmUp/20))   # Goes from 0 to 10
-        #     dots = '=' * num_dots+'>'
-        #     message = f'\rWarm up in progress |{dots:<20}|'  # pad to keep length constant
-        #     sys.stdout.write(message)
-        #     sys.stdout.flush()            
-            
-            
-        if Patience >= 100 or l >= MaxIter:
-            stop = True
-    
-    # Collect the results
-    result = {
-		"mean" : MeanEst,
-		"mse" : MeanEst,
-		"time" : Time,
-		"niter" : l,
-		}
-    
-    return result
-
-
-'''
-Conditional MC
-'''
-def conditionalMC(WindLen, Kappa, IntRange, Level, MaxIter=10**8, WarmUp = 10000, Tol=0.001):
-    """
-    Implementation of the conditional Monte Carlo simulation method for estimating the rare-event 
-    probabilities on the edge count. 
-
-    Parameters
-    ----------
-    WindLen : float
-        Length of each side of the square window (lambda).
-    Kappa : float
-        Intensity of the the Poisson point process.
-    IntRange : float
-        Interation range create edges in the Geometric random graph. 
-    Level : int 
-        Threshold parameter ell in the rare-event definition on edge count.
-    MaxIter : int
-        Maximum number iterations. Algorithm terminates irrespective convergence once 
-        the number of iterations reaches this number. 
-        Default value 10**8
-    WarmUp : int
-        Minimum number of iterations used in the algorithm. Termination conditions are 
-        checked only after these many iterations. 
-        Default value 10000.
-    Tol : float
-        Tolerance used for termination. Algorithm terminates when the relative variance of 
-        the mean estimator Z falls below Tol consecutively over 100 iterations. 
-        Default value 0.001.
-
-    Returns
-    -------
-    result : dictionary
-    
-             result["mean"] : Sample mean estimate
-             result["mse"] : Sample mean square estimate
-             result["time"] : Process time taken by the algorithm
-             result["niter"] : Number of iterations before termination
-
-    """
-
-    ExpPoissonCount = Kappa*(WindLen**2) ## Expected number of Poisson points.
-    nBins = int(WindLen/IntRange)     ## Number of bins.
-    BinEdg = WindLen/nBins            ## Side length of each bin.
-    MeanEst = 0.0                     ## Sample mean of the estimator
-    MeanSqrEst = 0.0                  ## Sample mean of the suqares of estimator
-    Time = 0.0
-    
-    Patience = 0
-    l = 0
-    stop = False
-    print("Warming up ...... ")
-    
-    while not stop:
-        tic = time.process_time()
-        l += 1        
-        BinnedPoints = [[[] for _ in range(nBins)] for _ in range(nBins)]
-        EdgeCount = 0
-        n = 0
-        while EdgeCount <= Level:
-            NewPoint = WindLen*np.random.random_sample(2)
-            n = n + 1
-            EdgeCount = EdgeCount + newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, nBins)
-            bin_x = int(NewPoint[0]/BinEdg)
-            bin_y = int(NewPoint[1]/BinEdg)
-            BinnedPoints[bin_x][bin_y].append(NewPoint)
-                
-        Y_hat = poisson.cdf(n - 1, ExpPoissonCount)
-        MeanEst = ((l-1)*MeanEst + Y_hat)/l
-        MeanSqrEst = ((l-1)*MeanSqrEst + Y_hat*Y_hat)/l
-        RV = MeanSqrEst/(MeanEst**2) - 1
-        toc = time.process_time()
-        Time += toc - tic
-        
-        if l%WarmUp == 0:
-            
-            clear_output(wait=True)
-            print('\n----- Iteration: ', l, '-----')
-            print('\nMean estimate Z (CMC):', sci(MeanEst))
-            print('Relative variance of Y_hat (CMC):', sci(RV)) 
-            print('Relative variance of Z (CMC):', sci(RV/l)) 
-            
-        if l >= WarmUp:
-            if RV/l < Tol:
-                Patience += 1
-            else:
-                Patience = 0  
-            
-        if Patience >= 100 or l >= MaxIter:
-            stop = True
-        
-    
-    # Collect the results
-    result = {
-		"mean" : MeanEst,
-		"mse" : MeanSqrEst,
-		"time" : Time,
-		"niter" : l,
-		}
-    return result
-
-
-
-''' 
-Distance between given two cells
-'''
 def distBtwCells(xx, yy):
     dist = np.linalg.norm(xx - yy)
-    dist = max(dist, np.linalg.norm(xx + [0,1] - yy))
-    dist = max(dist, np.linalg.norm(xx + [1,1] - yy))
-    dist = max(dist, np.linalg.norm(xx + [1,0] - yy))
-    
-    dist = max(dist, np.linalg.norm(xx - yy - [0,1]))
-    dist = max(dist, np.linalg.norm(xx - yy - [1,1]))
-    dist = max(dist, np.linalg.norm(xx - yy - [1,0]))
-    
+    dist = max(dist, np.linalg.norm(xx + [0, 1] - yy))
+    dist = max(dist, np.linalg.norm(xx + [1, 1] - yy))
+    dist = max(dist, np.linalg.norm(xx + [1, 0] - yy))
+    dist = max(dist, np.linalg.norm(xx - yy - [0, 1]))
+    dist = max(dist, np.linalg.norm(xx - yy - [1, 1]))
+    dist = max(dist, np.linalg.norm(xx - yy - [1, 0]))
     return dist
 
-'''
-Identifying the neighbors of each event in the dependency graph
-'''
+
 def generateNeighborsMatrix(GridEdg, IntRange):
-    spread = int(IntRange/GridEdg) - 1
+    spread = int(IntRange / GridEdg) - 1
     if spread < 0:
-        print("Error: cell digonal length is bigger than IntRange")
-        
-    arr_size = 2*spread + 1
-    Neighbors = np.zeros((arr_size, arr_size), dtype=int)
+        print("Error: cell diagonal length is bigger than IntRange")
+    arr_size = 2 * spread + 1
+    Neighbors = np.zeros((arr_size, arr_size), dtype=np.int32)
     center = np.array((spread, spread))
     for x in range(arr_size):
         for y in range(arr_size):
-            dist = distBtwCells(np.array((x,y)), center)
-            if dist*GridEdg <= IntRange:
-                Neighbors[x][y] = 1 ## the cell is completely inside
+            dist = distBtwCells(np.array((x, y)), center)
+            if dist * GridEdg <= IntRange:
+                Neighbors[x][y] = 1
     return Neighbors
 
-'''
-Generates the next point.
-'''
-def generateNextPoint(GridSize, GridEdg, IntRange, EdgeCount, OrderMatrix, Neighbors, Level):
-    
-    tic0 = time.time()
-    NonBlockCells = np.argwhere(OrderMatrix <= Level - EdgeCount)
-    toc0 = time.time()
-    NonBlockCount = NonBlockCells.shape[0]
-    if NonBlockCount > 0:
-        Index = np.random.randint(NonBlockCells.shape[0])
-        X_ind = NonBlockCells[Index][0]
-        Y_ind = NonBlockCells[Index][1]
-    
-    
-        
-        NewPoint = (np.array([X_ind, Y_ind]) + np.random.random_sample(2))*GridEdg
-        spread = int((Neighbors.shape[0] - 1)/2)
-        
-        x_left = min(X_ind, spread)
-        x_right = min(GridSize - X_ind, spread + 1)
-        y_left = min(Y_ind, spread)
-        y_right = min(GridSize - Y_ind, spread + 1)
-            
-        OrderMatrix[X_ind - x_left:X_ind + x_right, Y_ind - y_left: Y_ind + y_right] += Neighbors[spread - x_left:spread + x_right, spread - y_left: spread + y_right]
-    else:
-        NewPoint = None
-        
-    return NewPoint, NonBlockCount, toc0 - tic0
 
-''' 
-Counts edges between new point and existing points
-'''
-def newEdges(NewPoint, BinnedPoints, IntRange, BinEdg, nBins):
+# ── Numba kernels ─────────────────────────────────────────────────────────────
 
-    count = 0
-    bin_x = int(NewPoint[0]/BinEdg)
-    bin_y = int(NewPoint[1]/BinEdg)
-    
-    for i in range(max(0, bin_x-1), min(bin_x+2, nBins)):
-        for j in range(max(0, bin_y-1), min(bin_y+2, nBins)):
-            for pt in BinnedPoints[i][j]:
-                if linalg.norm(pt - NewPoint) < IntRange:
-                    count += 1
-    return count 
+@njit
+def _seed_numba(seed):
+    """Seed Numba's internal RNG (separate from numpy's global RNG)."""
+    np.random.seed(seed)
 
-'''
- IS implementation 
-'''
-def ISMC(WindLen, GridRes, Kappa, IntRange, Level, MaxIter=10**8, WarmUp=1000, Tol=0.001):
+
+@njit
+def _ismc_sample(OrderMatrix, BinnedPoints, BinCounts, hist, LHR,
+                 Neighbors, spread, GridSize, nBins,
+                 GridEdg, BinEdg, ir2, Level,
+                 total_cells, hist_len, q):
     """
-    Implementation of the importance sampling based Monte Carlo simulation method for estimating the rare-event 
-    probabilities on the edge count. 
+    Run one IS sample (the full inner loop) entirely in native code.
 
-    Parameters
-    ----------
-    WindLen : float
-        Length of each side of the square window (lambda).
-    GridRes : int
-        Resolution of the grid, i.e. the number of grid cells per unit length.
-    Kappa : float
-        Intensity of the the Poisson point process.
-    IntRange : float
-        Interation range create edges in the Geometric random graph. 
-    Level : int 
-        Threshold parameter ell in the rare-event definition on edge count.
-    MaxIter : int
-        Maximum number iterations. Algorithm terminates irrespective convergence once 
-        the number of iterations reaches this number. 
-        Default value 10**8
-    WarmUp : int
-        Minimum number of iterations used in the algorithm. Termination conditions are 
-        checked only after these many iterations. 
-        Default value 1000.
-    Tol : float
-        Tolerance used for termination. Algorithm terminates when the relative variance of 
-        the mean estimator Z falls below Tol consecutively over 100 iterations. 
-        Default value 0.001.
+    All working arrays are reset in-place at the start so they can be
+    pre-allocated once and reused across outer iterations.
 
     Returns
     -------
-    result : dictionary
-    
-             result["mean"] : Sample mean estimate
-             result["mse"] : Sample mean square estimate
-             result["time"] : Process time taken by the algorithm
-             result["niter"] : Number of iterations before termination
-
+    Y_tilde : float64
+        The IS likelihood-ratio estimator q · LHR for this sample.
     """
-    
-    ExpPoissonCount = Kappa*(WindLen**2) ## Expected number of Poisson points.
-    nBins = int(WindLen/IntRange)     ## Number of bins.
-    GridSize = int(nBins*GridRes)      ## Grid size on the whole window.
-    GridEdg = WindLen/GridSize
-    BinEdg = WindLen/nBins
-    npts = int(2*ExpPoissonCount)
-    q = np.array([poisson.pmf(k, ExpPoissonCount) for k in range(npts+1)])
-    
-    MeanEst = 0.0                     ## Sample mean of the estimator
-    MeanSqrEst = 0.0                  ## Sample mean of the suqares of estimator 
-    Time = 0.0
-    
-    Neighbors = generateNeighborsMatrix(GridEdg, IntRange)  
-    
-    Patience = 0
-    l = 0
-    stop = False
+    # ── Reset working arrays in-place ────────────────────────────────────────
+    OrderMatrix.fill(0)
+    BinCounts.fill(0)
+    hist.fill(0)
+    LHR.fill(0.0)
+    hist[0] = total_cells
+    LHR[0] = 1.0
+
+    NonBlockCount = total_cells
+    threshold     = Level
+    EdgeCount     = 0
+    n_max         = len(LHR) - 1
+
+    for n in range(n_max):
+
+        if NonBlockCount == 0:
+            break
+
+        # ── Select a random non-blocked cell ─────────────────────────────────
+        # Dense regime (> 5 % non-blocked): rejection sampling, O(1) expected.
+        # Sparse regime: sequential scan, O(total_cells) but compiled to native.
+        if NonBlockCount * 20 > total_cells:
+            while True:
+                flat = np.random.randint(0, total_cells)
+                row  = flat // GridSize
+                col  = flat %  GridSize
+                if OrderMatrix[row, col] <= threshold:
+                    break
+        else:
+            chosen = np.random.randint(0, NonBlockCount)
+            cnt    = 0
+            row    = 0
+            col    = 0
+            done   = False
+            for ii in range(GridSize):
+                for jj in range(GridSize):
+                    if OrderMatrix[ii, jj] <= threshold:
+                        if cnt == chosen:
+                            row  = ii
+                            col  = jj
+                            done = True
+                            break
+                        cnt += 1
+                if done:
+                    break
+
+        # LHR uses NonBlockCount from BEFORE this step's updates
+        LHR[n + 1] = LHR[n] * NonBlockCount / total_cells
+
+        # ── Generate point uniformly inside the selected cell ─────────────────
+        px = (row + np.random.random()) * GridEdg
+        py = (col + np.random.random()) * GridEdg
+
+        # ── Update OrderMatrix and hist for the neighbourhood ─────────────────
+        x_left  = row         if row         < spread     else spread
+        x_right = GridSize - row if GridSize - row < spread + 1 else spread + 1
+        y_left  = col         if col         < spread     else spread
+        y_right = GridSize - col if GridSize - col < spread + 1 else spread + 1
+
+        for di in range(-x_left, x_right):
+            for dj in range(-y_left, y_right):
+                if Neighbors[spread + di, spread + dj] == 1:
+                    ii    = row + di
+                    jj    = col + dj
+                    old_v = OrderMatrix[ii, jj]
+                    new_v = old_v + 1
+                    OrderMatrix[ii, jj] = new_v
+                    if old_v <= threshold:
+                        hist[old_v] -= 1
+                        if new_v <= threshold:
+                            hist[new_v] += 1
+                        else:
+                            NonBlockCount -= 1
+
+        # ── Count new edges (squared distance, no sqrt) ───────────────────────
+        bin_x  = int(px / BinEdg)
+        bin_y  = int(py / BinEdg)
+        lo_i   = bin_x - 1 if bin_x > 0      else 0
+        hi_i   = bin_x + 2 if bin_x + 2 <= nBins else nBins
+        lo_j   = bin_y - 1 if bin_y > 0      else 0
+        hi_j   = bin_y + 2 if bin_y + 2 <= nBins else nBins
+        new_edges = 0
+        for i in range(lo_i, hi_i):
+            for j in range(lo_j, hi_j):
+                for k in range(BinCounts[i, j]):
+                    dx = BinnedPoints[i, j, k, 0] - px
+                    dy = BinnedPoints[i, j, k, 1] - py
+                    if dx * dx + dy * dy < ir2:
+                        new_edges += 1
+        EdgeCount += new_edges
+
+        if EdgeCount > Level:
+            LHR[n + 1] = 0.0
+            break
+
+        # ── Store new point ───────────────────────────────────────────────────
+        k = BinCounts[bin_x, bin_y]
+        BinnedPoints[bin_x, bin_y, k, 0] = px
+        BinnedPoints[bin_x, bin_y, k, 1] = py
+        BinCounts[bin_x, bin_y] = k + 1
+
+        # ── Tighten threshold when EdgeCount grows ────────────────────────────
+        new_threshold = Level - EdgeCount
+        if new_threshold < threshold:
+            for v in range(new_threshold + 1, threshold + 1):
+                NonBlockCount -= hist[v]
+                hist[v] = 0
+            threshold = new_threshold
+
+    # ── Y_tilde = q · LHR ────────────────────────────────────────────────────
+    return np.dot(q, LHR)
+
+
+# ── naiveMC (identical to ec.py) ─────────────────────────────────────────────
+
+def naiveMC(WindLen, Kappa, IntRange, Level, MaxIter=10**8, WarmUp=100000, Tol=0.001, Seed=None):
+    if Seed is not None: np.random.seed(Seed)
+    ExpPoiCount = Kappa * (WindLen ** 2)
+    BinSize     = int(WindLen / IntRange)
+    BinEdg      = WindLen / BinSize
+    MeanEst     = 0.0
+    Time        = 0.0
+    Patience    = 0
+    l           = 0
+    stop        = False
     print("Warming up ...... ")
-    
+
     while not stop:
-        tic = time.process_time()                 ## Process time start
-        l += 1
-        BinnedPoints = [[[] for _ in range(nBins)] for _ in range(nBins)]
-        OrderMatrix = np.zeros((GridSize, GridSize), dtype=int)
-        EdgeCount = 0
-        NonBlockCount = int(GridSize**2)
-        LHR = np.zeros(npts+1)
-        LHR[0] = 1.0
-        n = 0
-        while EdgeCount <= Level and NonBlockCount > 0 and n < npts:
-            
-            NewPoint, NonBlockCount, time_gen = generateNextPoint(GridSize, GridEdg, IntRange, EdgeCount, OrderMatrix, Neighbors, Level)
-            n += 1
-            LHR[n] = LHR[n-1]*(NonBlockCount/(GridSize**2)) 
-            if NonBlockCount > 0:
-                EdgeCount += newEdges(NewPoint, BinnedPoints, IntRange, BinEdg, nBins)       
-                if EdgeCount > Level:
-                    LHR[n] = 0.0
-                    
-                bin_x = int(NewPoint[0]/BinEdg)
-                bin_y = int(NewPoint[1]/BinEdg)
-                BinnedPoints[bin_x][bin_y].append(NewPoint)
-                
-        Y_tilde = q@LHR
-        MeanEst = (l*MeanEst + Y_tilde)/(l+1)
-        MeanSqrEst = (l*MeanSqrEst + Y_tilde*Y_tilde)/(l+1)
-        RV = MeanSqrEst/(MeanEst**2) - 1
-        toc = time.process_time()  # Process time ends
-        Time += toc - tic
-        
-        if l%WarmUp == 0:
+        tic = time.process_time()
+        l  += 1
+        BinnedPoints = [[[] for _ in range(BinSize)] for _ in range(BinSize)]
+        EdgeCount    = 0
+        N            = np.random.poisson(ExpPoiCount)
+        Y            = 1
+        n            = 1
+        while Y == 1 and n <= N:
+            NewPoint  = WindLen * np.random.random_sample(2)
+            n        += 1
+            EdgeCount += newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, BinSize)
+            bin_x = int(NewPoint[0] / BinEdg)
+            bin_y = int(NewPoint[1] / BinEdg)
+            BinnedPoints[bin_x][bin_y].append(NewPoint)
+            if EdgeCount > Level:
+                Y = 0
+
+        MeanEst = ((l - 1) * MeanEst + Y) / l
+        RV      = (1 / MeanEst - 1) if MeanEst != 0 else np.inf
+        toc     = time.process_time()
+        Time   += toc - tic
+
+        if l % WarmUp == 0:
             clear_output(wait=True)
             print('\n----- Iteration: ', l, '-----')
-            print('\nGrid size:', GridSize,'x', GridSize)
-            print('Mean estimate Z (IS):', sci(MeanEst)) 
-            print('Relative variance of Y_tilde (IS):', sci(RV))
-            print('Relative variance of Z (IS):', sci(RV/l))
-            
-            
+            print('\nMean estimate Z (NMC):', sci(MeanEst))
+            print('Relative variance of Y (NMC):', sci(RV))
+            print('Relative variance of Z (NMC):', sci(RV / l))
+
         if l >= WarmUp:
-            if RV/l < Tol:
-                Patience += 1
-            else:
-                Patience = 0  
-            
+            Patience = Patience + 1 if RV / l < Tol else 0
+
         if Patience >= 100 or l >= MaxIter:
             stop = True
-            
 
-    
-    # Collect the results
-    result = {
-		"mean" : MeanEst,
-		"mse" : MeanSqrEst,
-		"time" : Time,
-		"niter" : l,
-		}
-    
-    return result
+    return {"mean": MeanEst, "mse": MeanEst, "time": Time, "niter": l}
+
+
+# ── conditionalMC (identical to ec.py) ───────────────────────────────────────
+
+def conditionalMC(WindLen, Kappa, IntRange, Level, MaxIter=10**8, WarmUp=10000, Tol=0.001, Seed=None):
+    if Seed is not None: np.random.seed(Seed)
+    ExpPoissonCount = Kappa * (WindLen ** 2)
+    nBins           = int(WindLen / IntRange)
+    BinEdg          = WindLen / nBins
+    MeanEst         = 0.0
+    MeanSqrEst      = 0.0
+    Time            = 0.0
+    Patience        = 0
+    l               = 0
+    stop            = False
+    print("Warming up ...... ")
+
+    while not stop:
+        tic = time.process_time()
+        l  += 1
+        BinnedPoints = [[[] for _ in range(nBins)] for _ in range(nBins)]
+        EdgeCount    = 0
+        n            = 0
+        while EdgeCount <= Level:
+            NewPoint   = WindLen * np.random.random_sample(2)
+            n         += 1
+            EdgeCount  += newEdges_bin_version(NewPoint, BinnedPoints, IntRange, BinEdg, nBins)
+            bin_x = int(NewPoint[0] / BinEdg)
+            bin_y = int(NewPoint[1] / BinEdg)
+            BinnedPoints[bin_x][bin_y].append(NewPoint)
+
+        Y_hat      = poisson.cdf(n - 1, ExpPoissonCount)
+        MeanEst    = ((l - 1) * MeanEst    + Y_hat)          / l
+        MeanSqrEst = ((l - 1) * MeanSqrEst + Y_hat * Y_hat)  / l
+        RV         = MeanSqrEst / (MeanEst ** 2) - 1
+        toc        = time.process_time()
+        Time      += toc - tic
+
+        if l % WarmUp == 0:
+            clear_output(wait=True)
+            print('\n----- Iteration: ', l, '-----')
+            print('\nMean estimate Z (CMC):', sci(MeanEst))
+            print('Relative variance of Y_hat (CMC):', sci(RV))
+            print('Relative variance of Z (CMC):', sci(RV / l))
+
+        if l >= WarmUp:
+            Patience = Patience + 1 if RV / l < Tol else 0
+
+        if Patience >= 100 or l >= MaxIter:
+            stop = True
+
+    return {"mean": MeanEst, "mse": MeanSqrEst, "time": Time, "niter": l}
+
+
+# ── ISMC (Numba-accelerated) ──────────────────────────────────────────────────
+
+def ISMC(WindLen, GridRes, Kappa, IntRange, Level, MaxIter=10**8, WarmUp=1000, Tol=0.001, Seed=None):
+    """
+    Numba-accelerated IS Monte Carlo for edge-count rare events.
+
+    Interface identical to ec.ISMC.  The first call triggers JIT compilation
+    (~2–5 s); that one-time cost is excluded from the reported timing.
+    """
+    if Seed is not None:
+        np.random.seed(Seed)
+        _seed_numba(Seed)
+
+    ExpPoissonCount = Kappa * (WindLen ** 2)
+    nBins           = int(WindLen / IntRange)
+    GridSize        = int(nBins * GridRes)
+    GridEdg         = WindLen / GridSize
+    BinEdg          = WindLen / nBins
+    npts            = int(2 * ExpPoissonCount)
+    ir2             = IntRange * IntRange
+
+    q         = np.array([poisson.pmf(k, ExpPoissonCount) for k in range(npts + 1)])
+    Neighbors = generateNeighborsMatrix(GridEdg, IntRange)
+    Neighbors = Neighbors.astype(np.int32)
+    spread    = (Neighbors.shape[0] - 1) // 2
+    total_cells = GridSize * GridSize
+    hist_len    = Level + 2
+
+    # Pre-allocate working arrays once; _ismc_sample resets them each call.
+    # max_pts_bin: conservative upper bound on points per bin per IS trajectory.
+    max_pts_bin  = npts + 1
+    OrderMatrix  = np.zeros((GridSize, GridSize),             dtype=np.int32)
+    BinnedPoints = np.zeros((nBins, nBins, max_pts_bin, 2),   dtype=np.float64)
+    BinCounts    = np.zeros((nBins, nBins),                   dtype=np.int32)
+    hist         = np.zeros(hist_len,                         dtype=np.int64)
+    LHR          = np.zeros(npts + 1,                         dtype=np.float64)
+
+    # ── Trigger JIT compilation with one dry run (result discarded) ───────────
+    print("Compiling Numba kernel (one-time) ...")
+    _ = _ismc_sample(OrderMatrix, BinnedPoints, BinCounts, hist, LHR,
+                     Neighbors, spread, GridSize, nBins,
+                     GridEdg, BinEdg, ir2, Level,
+                     total_cells, hist_len, q)
+    print("Warming up ...... ")
+
+    MeanEst    = 0.0
+    MeanSqrEst = 0.0
+    Time       = 0.0
+    Patience   = 0
+    l          = 0
+    stop       = False
+
+    while not stop:
+        tic = time.process_time()
+        l  += 1
+
+        Y_tilde = _ismc_sample(OrderMatrix, BinnedPoints, BinCounts, hist, LHR,
+                               Neighbors, spread, GridSize, nBins,
+                               GridEdg, BinEdg, ir2, Level,
+                               total_cells, hist_len, q)
+
+        MeanEst    = ((l - 1) * MeanEst    + Y_tilde)           / l
+        MeanSqrEst = ((l - 1) * MeanSqrEst + Y_tilde * Y_tilde) / l
+        RV         = MeanSqrEst / (MeanEst ** 2) - 1
+        toc        = time.process_time()
+        Time      += toc - tic
+
+        if l % WarmUp == 0:
+            clear_output(wait=True)
+            print('\n----- Iteration: ', l, '-----')
+            print('\nGrid size:', GridSize, 'x', GridSize)
+            print('Mean estimate Z (IS):', sci(MeanEst))
+            print('Relative variance of Y_tilde (IS):', sci(RV))
+            print('Relative variance of Z (IS):', sci(RV / l))
+
+        if l >= WarmUp:
+            Patience = Patience + 1 if RV / l < Tol else 0
+
+        if Patience >= 100 or l >= MaxIter:
+            stop = True
+
+    return {"mean": MeanEst, "mse": MeanSqrEst, "time": Time, "niter": l}
