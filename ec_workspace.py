@@ -53,7 +53,7 @@ print('Process time (sec):', round(result_cmc['time'], 3))
 print('Number of iterations:', result_cmc['niter'])
 
 #%%
-GridRes = 20 # the number of grid cells per unit length
+GridRes = 20 # the number of grid cells per interaction range
 
 t0 = time.process_time()
 result_ismc = ec.ISMC(WindLen, GridRes, Kappa, IntRange, Level, Seed=42)
