@@ -23,7 +23,7 @@ Three estimators are implemented for each example.
 
 # Performance
 
-The table below compares CMC and IS at a precision target of RV/m < 0.01, with window W = [0,10]², r = 1, and a 100×100 IS grid. Probabilities are approximately 10⁻⁴. CMC times marked † are extrapolated from a pilot run.
+The relative variance (RV) of an estimator Ẑ is defined as Var(Ẑ) / E[Ẑ]², and measures estimation efficiency independently of the probability level — a smaller RV means fewer samples are needed for the same precision. The table below compares CMC and IS at a precision target of RV/m < 0.01, with window W = [0,10]², r = 1, and a 100×100 IS grid. Probabilities are approximately 10⁻⁴. CMC times marked † are extrapolated from a pilot run.
 
 | Example | Z | RV (CMC) | Time CMC (s) | RV (IS) | Time IS (s) | Speedup |
 |---------|---|----------|--------------|---------|-------------|---------|
